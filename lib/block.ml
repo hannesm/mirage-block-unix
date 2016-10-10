@@ -92,7 +92,7 @@ module Config = struct
 end
 
 type t = {
-  mutable fd: Lwt_unix.file_descr option;
+  fd: Lwt_unix.file_descr;
   m: Lwt_mutex.t;
   mutable info: info;
   config: Config.t;
@@ -164,7 +164,7 @@ let of_config ({ Config.buffered; sync; path } as config) =
       let fd = Lwt_unix.of_unix_file_descr fd in
       let m = Lwt_mutex.create () in
       let use_fsync_on_flush = sync in
-      return ({ fd = Some fd; m; info = { sector_size; size_sectors; read_write };
+      return ({ fd; m; info = { sector_size; size_sectors; read_write };
         config; use_fsync_after_write; use_fsync_on_flush })
   with e ->
     Log.err (fun f -> f "connect %s: failed to open file" path);
@@ -186,13 +186,7 @@ let connect ?buffered ?sync name =
   let config = Config.create ?buffered ?sync name in
   of_config config
 
-let disconnect t = match t.fd with
-  | Some fd ->
-    Lwt_unix.close fd >>= fun () ->
-    t.fd <- None;
-    return ()
-  | None ->
-    return ()
+let disconnect t = Lwt_unix.close t.fd
 
 let get_info { info } = return info
 
@@ -229,39 +223,34 @@ let lwt_wrap_exn t op offset ?buffer f =
 let rec read x sector_start buffers = match buffers with
   | [] -> return (`Ok ())
   | b :: bs ->
-    begin match x.fd with
-      | None -> return (`Error `Disconnected)
-      | Some fd ->
-        let offset = Int64.(mul sector_start (of_int x.info.sector_size))  in
-        lwt_wrap_exn x "read" offset ~buffer:b
-          (fun () ->
-             Lwt_mutex.with_lock x.m
-               (fun () ->
-                  let b_sectors = (Cstruct.len b) / x.info.sector_size in
-                  if Int64.(add sector_start (of_int b_sectors) > x.info.size_sectors) then begin
-                    Log.err (fun f -> f "read beyond end of file: sector_start (%Ld) + b (%d) > size_sectors (%Ld)"
-                                sector_start b_sectors x.info.size_sectors);
-                    fail End_of_file
-                  end else begin
-                    Lwt_unix.LargeFile.lseek fd offset Unix.SEEK_SET >>= fun _ ->
-                    really_read fd b
-                  end
-               ) >>= fun () ->
-             return (`Ok ())
-          ) >>= function
-        | `Ok () -> read x Int64.(add sector_start (div (of_int (Cstruct.len b)) 512L)) bs
-        | `Error x -> return (`Error x)
-    end
+    let fd = x.fd in
+    let offset = Int64.(mul sector_start (of_int x.info.sector_size))  in
+    lwt_wrap_exn x "read" offset ~buffer:b
+      (fun () ->
+         Lwt_mutex.with_lock x.m
+           (fun () ->
+              let b_sectors = (Cstruct.len b) / x.info.sector_size in
+              if Int64.(add sector_start (of_int b_sectors) > x.info.size_sectors) then begin
+                Log.err (fun f -> f "read beyond end of file: sector_start (%Ld) + b (%d) > size_sectors (%Ld)"
+                            sector_start b_sectors x.info.size_sectors);
+                fail End_of_file
+              end else begin
+                Lwt_unix.LargeFile.lseek fd offset Unix.SEEK_SET >>= fun _ ->
+                really_read fd b
+              end
+           ) >>= fun () ->
+         return (`Ok ())
+      ) >>= function
+    | `Ok () -> read x Int64.(add sector_start (div (of_int (Cstruct.len b)) 512L)) bs
+    | `Error x -> return (`Error x)
 
 let rec write x sector_start buffers = match buffers with
   | [] -> return (`Ok ())
   | b :: bs ->
     begin match x with
-      | { fd = None } ->
-        return (`Error `Disconnected)
       | { info = { read_write = false } } ->
         return (`Error `Is_read_only)
-      | { fd = Some fd } ->
+      | { fd = fd } ->
         let offset = Int64.(mul sector_start (of_int x.info.sector_size)) in
         lwt_wrap_exn x "write" offset ~buffer:b
           (fun () ->
@@ -289,63 +278,51 @@ let rec write x sector_start buffers = match buffers with
 
 let resize t new_size_sectors =
   let new_size_bytes = Int64.(mul new_size_sectors (of_int t.info.sector_size)) in
-  match t.fd with
-  | None -> return (`Error `Disconnected)
-  | Some fd ->
-    if is_win32
-    then return (`Error `Unimplemented)
-    else lwt_wrap_exn t "ftruncate" new_size_bytes
-        (fun () ->
-           Lwt_mutex.with_lock t.m
-             (fun () ->
-                Lwt_unix.LargeFile.ftruncate fd new_size_bytes
-                >>= fun () ->
-                t.info <- { t.info with size_sectors = new_size_sectors };
-                return (`Ok ())
-             )
-        )
+  if is_win32
+  then return (`Error `Unimplemented)
+  else lwt_wrap_exn t "ftruncate" new_size_bytes
+      (fun () ->
+         Lwt_mutex.with_lock t.m
+           (fun () ->
+              Lwt_unix.LargeFile.ftruncate t.fd new_size_bytes
+              >>= fun () ->
+              t.info <- { t.info with size_sectors = new_size_sectors };
+              return (`Ok ())
+           )
+      )
 
 external flush_job: Unix.file_descr -> unit Lwt_unix.job = "mirage_block_unix_flush_job"
 
 let flush t =
-  match t.fd with
-  | None -> return (`Error `Disconnected)
-  | Some fd ->
-    lwt_wrap_exn t "fsync" 0L
-      (fun () ->
-         ( if t.use_fsync_on_flush
-           then Lwt_unix.run_job (flush_job (Lwt_unix.unix_file_descr fd))
-           else Lwt.return_unit )
-         >>= fun () ->
-         return (`Ok ())
-      )
+  lwt_wrap_exn t "fsync" 0L
+    (fun () ->
+       ( if t.use_fsync_on_flush
+         then Lwt_unix.run_job (flush_job (Lwt_unix.unix_file_descr t.fd))
+         else Lwt.return_unit )
+       >>= fun () ->
+       return (`Ok ())
+    )
 
 let seek_mapped t from =
-  match t.fd with
-  | None -> return (`Error `Disconnected)
-  | Some fd ->
-    let offset = Int64.(mul from (of_int t.info.sector_size)) in
-    lwt_wrap_exn t "seek_mapped" offset
-      (fun () ->
-         Lwt_mutex.with_lock t.m
-           (fun () ->
-              let fd = Lwt_unix.unix_file_descr fd in
-              let offset = Raw.lseek_data fd offset in
-              return (`Ok Int64.(div offset (of_int t.info.sector_size)))
-           )
-      )
+  let offset = Int64.(mul from (of_int t.info.sector_size)) in
+  lwt_wrap_exn t "seek_mapped" offset
+    (fun () ->
+       Lwt_mutex.with_lock t.m
+         (fun () ->
+            let fd = Lwt_unix.unix_file_descr t.fd in
+            let offset = Raw.lseek_data fd offset in
+            return (`Ok Int64.(div offset (of_int t.info.sector_size)))
+         )
+    )
 
 let seek_unmapped t from =
-  match t.fd with
-  | None -> return (`Error `Disconnected)
-  | Some fd ->
-    let offset = Int64.(mul from (of_int t.info.sector_size)) in
-    lwt_wrap_exn t "seek_unmapped" offset
-      (fun () ->
-         Lwt_mutex.with_lock t.m
-           (fun () ->
-              let fd = Lwt_unix.unix_file_descr fd in
-              let offset = Raw.lseek_hole fd offset in
-              return (`Ok Int64.(div offset (of_int t.info.sector_size)))
-           )
-      )
+  let offset = Int64.(mul from (of_int t.info.sector_size)) in
+  lwt_wrap_exn t "seek_unmapped" offset
+    (fun () ->
+       Lwt_mutex.with_lock t.m
+         (fun () ->
+            let fd = Lwt_unix.unix_file_descr t.fd in
+            let offset = Raw.lseek_hole fd offset in
+            return (`Ok Int64.(div offset (of_int t.info.sector_size)))
+         )
+    )
